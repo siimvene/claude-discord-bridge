@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import 'dotenv/config';
+import { IMAGE_MIME, buildContent, splitMessage, resolvePermissionMode } from './lib.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -15,6 +16,14 @@ const MAX_ATTACHMENT_BYTES = Number(process.env.MAX_ATTACHMENT_BYTES || 25 * 102
 // Anthropic Messages API caps images at 5MB raw and 8000x8000 px. We can't easily
 // check dimensions without decoding, but we can enforce the byte cap up front.
 const MAX_IMAGE_BYTES = Number(process.env.MAX_IMAGE_BYTES || 5 * 1024 * 1024);
+
+// SDK permission mode: 'default' | 'acceptEdits' | 'bypassPermissions' | 'plan'.
+// 'default' will hang in a non-interactive bot context (no human to approve tools),
+// so the practical choices are 'bypassPermissions' (full agency, default) or
+// 'acceptEdits' (auto-approve file edits but block other tools).
+// SECURITY: 'bypassPermissions' lets anyone authorized in your access.json run
+// arbitrary shell commands on the host. Treat it like SSH access.
+const PERMISSION_MODE = resolvePermissionMode(process.env.PERMISSION_MODE);
 
 fs.mkdirSync(STATE_DIR, { recursive: true });
 
@@ -90,7 +99,6 @@ async function shouldProcess(message, clientUserId) {
 }
 
 // ----- attachment handling -----
-const IMAGE_MIME = /^image\/(png|jpe?g|gif|webp)$/i;
 
 async function fetchAttachments(msg) {
   if (msg.attachments.size === 0) return [];
@@ -118,43 +126,6 @@ async function fetchAttachments(msg) {
     }
   }
   return out;
-}
-
-function buildContent(text, attachments) {
-  const blocks = [];
-  if (text) blocks.push({ type: 'text', text });
-
-  const failed = [];
-  const savedPaths = [];
-  for (const att of attachments) {
-    if (att.error) {
-      failed.push(`${att.name ?? 'unnamed'} (failed: ${att.error})`);
-      continue;
-    }
-    if (att.data && att.type && IMAGE_MIME.test(att.type)) {
-      blocks.push({
-        type: 'image',
-        source: { type: 'base64', media_type: att.type, data: att.data.toString('base64') },
-      });
-    } else if (att.data) {
-      // Non-image: write to /tmp and inject path so Claude can Read it
-      const safe = (att.name || 'unnamed').replace(/[^a-zA-Z0-9._-]/g, '_');
-      const dest = `/tmp/discord-${Date.now()}-${safe}`;
-      fs.writeFileSync(dest, att.data);
-      savedPaths.push(`${dest} (${att.type ?? 'unknown'}, ${att.size}b)`);
-    }
-  }
-  if (savedPaths.length || failed.length) {
-    let note = '';
-    if (savedPaths.length) note += `\n\n[attachments: ${savedPaths.join(', ')}]`;
-    if (failed.length) note += `\n\n[failed: ${failed.join(', ')}]`;
-    if (blocks.length === 0) blocks.push({ type: 'text', text: '(attachment)' });
-    blocks[0].text = (blocks[0].text || '') + note;
-  }
-
-  if (blocks.length === 0) return null;
-  if (blocks.length === 1 && blocks[0].type === 'text') return blocks[0].text;
-  return blocks;
 }
 
 // ----- per-channel agent -----
@@ -190,7 +161,7 @@ class ChannelAgent {
   }
 
   _startStream() {
-    const options = { permissionMode: 'bypassPermissions' };
+    const options = { permissionMode: PERMISSION_MODE };
     if (this.sessionId) options.resume = this.sessionId;
 
     this.stream = query({ prompt: this._feed(), options });
@@ -326,20 +297,6 @@ function buildContextEmbed(channelId) {
   const footer = `${bar} ${fillRounded}% · Turn ${turn} · ${tokensK}k / ${windowK}k tokens`;
   const color = fillRounded >= 75 ? 0xed4245 : fillRounded >= 50 ? 0xfee75c : 0x57f287;
   return new EmbedBuilder().setColor(color).setFooter({ text: footer });
-}
-
-function splitMessage(text, maxLen = 2000) {
-  if (text.length <= maxLen) return [text];
-  const chunks = [];
-  while (text.length > 0) {
-    if (text.length <= maxLen) { chunks.push(text); break; }
-    let idx = text.lastIndexOf('\n', maxLen);
-    if (idx < maxLen * 0.3) idx = text.lastIndexOf(' ', maxLen);
-    if (idx < maxLen * 0.3) idx = maxLen;
-    chunks.push(text.slice(0, idx));
-    text = text.slice(idx).trimStart();
-  }
-  return chunks;
 }
 
 async function processQueue(channelId) {
