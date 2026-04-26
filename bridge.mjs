@@ -25,6 +25,18 @@ const MAX_IMAGE_BYTES = Number(process.env.MAX_IMAGE_BYTES || 5 * 1024 * 1024);
 // arbitrary shell commands on the host. Treat it like SSH access.
 const PERMISSION_MODE = resolvePermissionMode(process.env.PERMISSION_MODE);
 
+// Agent lifecycle. Each ChannelAgent holds a persistent Claude subprocess +
+// MCP children, costing ~500-600MB resident. To keep memory bounded:
+//   - Idle agents are closed after IDLE_MINUTES of inactivity. Their session
+//     pointer persists in state/sessions.json, so the next message resumes
+//     the conversation (paying an ~8s cold start once).
+//   - Active agents are capped at MAX_ACTIVE_AGENTS. When the cap is reached
+//     and a new channel needs an agent, the LRU non-busy agent is evicted.
+//     If every agent is mid-turn, the cap is exceeded temporarily; idle
+//     eviction will trim back next time anything goes idle.
+const IDLE_MS = Math.max(0, Number(process.env.IDLE_MINUTES || 30)) * 60 * 1000;
+const MAX_ACTIVE_AGENTS = Math.max(1, Number(process.env.MAX_ACTIVE_AGENTS || 8));
+
 fs.mkdirSync(STATE_DIR, { recursive: true });
 
 // ----- state -----
@@ -140,7 +152,31 @@ class ChannelAgent {
     this.pendingResolve = null;
     this.responseText = '';
     this.responseUsage = null;
+    this.lastActivity = Date.now();
+    this._idleTimer = null;
     this._startStream();
+    this._scheduleIdleClose();
+  }
+
+  _touch() {
+    this.lastActivity = Date.now();
+    this._scheduleIdleClose();
+  }
+
+  _scheduleIdleClose() {
+    if (IDLE_MS <= 0 || this.closed) return;
+    if (this._idleTimer) clearTimeout(this._idleTimer);
+    const t = setTimeout(() => {
+      // Don't evict mid-turn; reschedule and check again later.
+      if (this.pendingResolve) { this._scheduleIdleClose(); return; }
+      const idleMin = Math.round((Date.now() - this.lastActivity) / 60000);
+      console.log(`[${this.channelId}] idle ${idleMin}min — closing agent (session ${this.sessionId} preserved)`);
+      this.close();
+      if (agents.get(this.channelId) === this) agents.delete(this.channelId);
+    }, IDLE_MS);
+    // Don't keep the event loop alive on idle agents during graceful shutdown.
+    t.unref?.();
+    this._idleTimer = t;
   }
 
   _push(envelope) {
@@ -259,6 +295,7 @@ class ChannelAgent {
   async send(content) {
     if (this.closed) throw new Error('agent closed');
     if (this.pendingResolve) throw new Error('agent busy with previous turn');
+    this._touch();
     return new Promise((resolve) => {
       this.pendingResolve = resolve;
       this._push({ content });
@@ -267,6 +304,7 @@ class ChannelAgent {
 
   close() {
     this.closed = true;
+    if (this._idleTimer) { clearTimeout(this._idleTimer); this._idleTimer = null; }
     while (this.resolvers.length) this.resolvers.shift()(null);
   }
 }
@@ -276,12 +314,33 @@ const agents = new Map();
 const queues = new Map();
 const channelBusy = new Map();
 
+function _evictLRU() {
+  // Find the least-recently-used agent that isn't currently mid-turn.
+  let oldest = null;
+  for (const a of agents.values()) {
+    if (a.pendingResolve) continue;
+    if (!oldest || a.lastActivity < oldest.lastActivity) oldest = a;
+  }
+  if (oldest) {
+    const idleMin = Math.round((Date.now() - oldest.lastActivity) / 60000);
+    console.log(`[${oldest.channelId}] LRU evict (idle ${idleMin}min, cap ${MAX_ACTIVE_AGENTS}, session ${oldest.sessionId} preserved)`);
+    oldest.close();
+    agents.delete(oldest.channelId);
+    return true;
+  }
+  console.warn(`[evict] all ${agents.size} agents busy, exceeding cap ${MAX_ACTIVE_AGENTS} temporarily`);
+  return false;
+}
+
 function getAgent(channelId) {
   let a = agents.get(channelId);
-  if (!a || a.closed) {
-    a = new ChannelAgent(channelId);
-    agents.set(channelId, a);
+  if (a && !a.closed) {
+    a._touch();
+    return a;
   }
+  if (agents.size >= MAX_ACTIVE_AGENTS) _evictLRU();
+  a = new ChannelAgent(channelId);
+  agents.set(channelId, a);
   return a;
 }
 

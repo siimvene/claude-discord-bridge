@@ -140,6 +140,10 @@ If you want a per-channel persona or different MCP set, you'd need to fork and p
 | `STATE_DIR` | `./state` | Where `sessions.json` lives |
 | `CONTEXT_WINDOW` | `1000000` | Window size for the progress bar (use `200000` for non-1M models) |
 | `MAX_ATTACHMENT_BYTES` | `26214400` (25 MiB) | Cap on per-attachment download size |
+| `MAX_IMAGE_BYTES` | `5242880` (5 MiB) | Cap on per-image attachment (Anthropic API limit) |
+| `PERMISSION_MODE` | `bypassPermissions` | SDK permission mode: `bypassPermissions` / `acceptEdits` / `plan` / `default`. See SECURITY section. |
+| `IDLE_MINUTES` | `30` | Close agents idle for this long. State persists; next message resumes (cold start ~8s). `0` disables. |
+| `MAX_ACTIVE_AGENTS` | `8` | Cap on simultaneously-live agents. LRU eviction when exceeded. Each agent ≈ 500-600MB resident. |
 
 ### `access.json` schema
 
@@ -160,7 +164,8 @@ The file is hot-reloaded on `mtime` change — edit it without restarting.
 
 ## Known limits
 
-- **Single-tenant assumption.** All channels share one process, one Discord token, one `~/.claude/` config tree. There's no per-channel persona / MCP isolation. (See [#per-channel-config](#per-channel-config) — it's the obvious next feature.)
+- **Single-tenant assumption.** All channels share one process, one Discord token, one `~/.claude/` config tree. There's no per-channel persona / MCP isolation.
+- **Memory scales linearly with active channels.** Each Claude subprocess + its MCP children costs ~500-600MB resident — an SDK constraint, not a design choice. `IDLE_MINUTES` + `MAX_ACTIVE_AGENTS` keep this bounded for low-traffic deployments by closing agents that have been idle (state persists, re-engagement pays one cold start). For genuinely-busy multi-tenant use cases, the answer is "run multiple bridges" or "use the raw `@anthropic-ai/sdk` and reimplement tool dispatch yourself".
 - **Token usage tracking is approximate.** The bar uses cumulative input+output tokens reported by the SDK, which doesn't perfectly match what the model sees as "context used" after caching/compaction.
 - **Stale-session recovery costs one turn.** If the bridge restarts pointing at a session that no longer exists, the first message in that channel surfaces `"turn failed during execution (likely stale session — please retry)"`; resending succeeds against a freshly created session. The SDK self-recovers; we just can't paper over the failed turn.
 
