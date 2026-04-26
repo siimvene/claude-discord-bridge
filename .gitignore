@@ -1,0 +1,17 @@
+node_modules/
+state/
+.env
+.env.local
+*.log
+*.bak
+*.tmp
+
+# personal
+access.json
+sessions.json
+
+# editors
+.vscode/
+.idea/
+*.swp
+.DS_Store
