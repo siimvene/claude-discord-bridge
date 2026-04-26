@@ -12,6 +12,9 @@ const STATE_DIR = process.env.STATE_DIR || path.join(__dirname, 'state');
 const STATE_FILE = path.join(STATE_DIR, 'sessions.json');
 const CONTEXT_WINDOW = Number(process.env.CONTEXT_WINDOW || 1_000_000);
 const MAX_ATTACHMENT_BYTES = Number(process.env.MAX_ATTACHMENT_BYTES || 25 * 1024 * 1024);
+// Anthropic Messages API caps images at 5MB raw and 8000x8000 px. We can't easily
+// check dimensions without decoding, but we can enforce the byte cap up front.
+const MAX_IMAGE_BYTES = Number(process.env.MAX_IMAGE_BYTES || 5 * 1024 * 1024);
 
 fs.mkdirSync(STATE_DIR, { recursive: true });
 
@@ -94,8 +97,16 @@ async function fetchAttachments(msg) {
   const out = [];
   for (const att of msg.attachments.values()) {
     try {
-      if (att.size > MAX_ATTACHMENT_BYTES) {
-        throw new Error(`too large: ${(att.size / 1024 / 1024).toFixed(1)}MB`);
+      const isImage = att.contentType && IMAGE_MIME.test(att.contentType);
+      const cap = isImage ? Math.min(MAX_ATTACHMENT_BYTES, MAX_IMAGE_BYTES) : MAX_ATTACHMENT_BYTES;
+      if (att.size > cap) {
+        const sizeMb = (att.size / 1024 / 1024).toFixed(1);
+        const capMb = (cap / 1024 / 1024).toFixed(1);
+        throw new Error(
+          isImage
+            ? `image ${sizeMb}MB exceeds ${capMb}MB Anthropic API limit`
+            : `attachment ${sizeMb}MB exceeds ${capMb}MB limit`
+        );
       }
       const res = await fetch(att.url);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -211,18 +222,57 @@ class ChannelAgent {
             const usage = this.responseUsage;
             this.responseText = '';
             this.responseUsage = null;
-            if (resolve) resolve({ text, usage });
+            // SDK signals errors via `is_error` / non-success subtypes on the result
+            // message. Surface them; otherwise the user sees a silent empty reply.
+            // (The SDK may also throw on the next iteration — handled in catch.)
+            const isError = msg.is_error === true ||
+              (typeof msg.subtype === 'string' && msg.subtype !== 'success');
+            if (resolve) {
+              if (isError) {
+                let reason;
+                if (msg.result) {
+                  reason = String(msg.result);
+                } else if (msg.subtype === 'error_during_execution' && this.sessionId) {
+                  // Most common cause when we'd been resuming: target session is gone.
+                  // SDK self-recovers on the next turn; tell the user to retry.
+                  reason = 'turn failed during execution (likely stale session — please retry)';
+                } else {
+                  reason = msg.subtype || 'execution error';
+                }
+                resolve({ text, usage, error: String(reason) });
+              } else {
+                resolve({ text, usage });
+              }
+            }
           }
         }
       } catch (err) {
         console.error(`[${this.channelId}] stream error: ${err.message}`);
-        if (err.message.includes('No conversation found') && this.sessionId) {
-          console.log(`[${this.channelId}] stale session ${this.sessionId} — clearing, retrying fresh`);
+        const isStaleSession = /no conversation found/i.test(err.message);
+        if (isStaleSession) {
+          // The previous resume target is gone. Clear pointer state, terminate any
+          // stale _feed() awaits routed to the dead generator, then start a fresh
+          // stream that will create a new session on next yield.
+          const previous = this.sessionId;
           this.sessionId = null;
           sessions.delete(this.channelId);
           saveState();
           this.responseText = '';
           this.responseUsage = null;
+          while (this.resolvers.length) {
+            const r = this.resolvers.shift();
+            try { r(null); } catch {}
+          }
+          if (this.pendingResolve) {
+            const resolve = this.pendingResolve;
+            this.pendingResolve = null;
+            resolve({
+              text: '',
+              usage: null,
+              error: `stale session ${previous || '(unknown)'} cleared — please resend`,
+            });
+          }
+          console.log(`[${this.channelId}] stale session ${previous || '(unknown)'} — cleared, restarting stream`);
           this._startStream();
           return;
         }

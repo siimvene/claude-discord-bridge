@@ -5,7 +5,8 @@
   "type": "module",
   "main": "bridge.mjs",
   "scripts": {
-    "start": "node bridge.mjs"
+    "start": "node bridge.mjs",
+    "test": "node test/smoke.mjs"
   },
   "engines": {
     "node": ">=20"

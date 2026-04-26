@@ -38,6 +38,12 @@ cp access.json.example access.json  # add your channel IDs and user IDs
 npm start
 ```
 
+To run the smoke test (exercises ChannelAgent against a stale session ID — needs a working SDK login):
+
+```bash
+npm test
+```
+
 To run as a systemd user service:
 
 ```bash
@@ -152,11 +158,11 @@ The file is hot-reloaded on `mtime` change — edit it without restarting.
 
 ---
 
-## Known issues
+## Known limits
 
-- **Recovery race after a stale session error.** When the SDK throws `No conversation found with session ID: ...`, the recovery path in `_startStream` clears the session and restarts the stream — but shared internal state between the old and new feed generators causes the next 1–2 messages to also fail before the new stream takes over. Workaround: `!!clear` after a stale-session error, or restart the service.
-- **Single-tenant assumption.** All channels share one process, one Discord token, one `~/.claude/` config tree. No per-channel persona / MCP isolation.
+- **Single-tenant assumption.** All channels share one process, one Discord token, one `~/.claude/` config tree. There's no per-channel persona / MCP isolation. (See [#per-channel-config](#per-channel-config) — it's the obvious next feature.)
 - **Token usage tracking is approximate.** The bar uses cumulative input+output tokens reported by the SDK, which doesn't perfectly match what the model sees as "context used" after caching/compaction.
+- **Stale-session recovery costs one turn.** If the bridge restarts pointing at a session that no longer exists, the first message in that channel surfaces `"turn failed during execution (likely stale session — please retry)"`; resending succeeds against a freshly created session. The SDK self-recovers; we just can't paper over the failed turn.
 
 ---
 
