@@ -1,4 +1,4 @@
-# discord-bridge
+# claude-discord-bridge
 
 A Discord bot that wraps [`@anthropic-ai/claude-agent-sdk`](https://www.npmjs.com/package/@anthropic-ai/claude-agent-sdk) so each Discord channel becomes its own persistent Claude conversation.
 
@@ -31,7 +31,7 @@ If this isn't the trade-off you want, this is the wrong project. A version with 
 
 ```bash
 git clone <your-fork>
-cd discord-bridge
+cd claude-discord-bridge
 npm install
 cp .env.example .env             # add your DISCORD_TOKEN
 cp access.json.example access.json  # add your channel IDs and user IDs
@@ -47,11 +47,11 @@ npm test
 To run as a systemd user service:
 
 ```bash
-cp discord-bridge.service.example ~/.config/systemd/user/discord-bridge.service
+cp claude-discord-bridge.service.example ~/.config/systemd/user/claude-discord-bridge.service
 # edit paths inside, then
 systemctl --user daemon-reload
-systemctl --user enable --now discord-bridge.service
-journalctl --user -u discord-bridge -f
+systemctl --user enable --now claude-discord-bridge.service
+journalctl --user -u claude-discord-bridge -f
 ```
 
 ### Discord bot setup
@@ -102,7 +102,7 @@ Sessions are stored where the SDK puts them:
 ~/.claude/projects/<sanitized-cwd>/<sessionId>.jsonl
 ```
 
-The `sanitized-cwd` is the SDK process's working directory with `/` replaced by `-`. So a bridge running in `/home/you/projects/discord-bridge` stores sessions under `~/.claude/projects/-home-you-projects-discord-bridge/`.
+The `sanitized-cwd` is the SDK process's working directory with `/` replaced by `-`. So a bridge running in `/home/you/projects/claude-discord-bridge` stores sessions under `~/.claude/projects/-home-you-projects-claude-discord-bridge/`.
 
 Across restarts, `state/sessions.json` (in the bridge directory) is the pointer file mapping each channel to its session ID. When the bridge wakes, it reads this map and tells the SDK `options.resume = sessionId` for each channel's first message.
 

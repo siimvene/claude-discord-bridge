@@ -1,5 +1,5 @@
 {
-  "name": "discord-bridge",
+  "name": "claude-discord-bridge",
   "version": "0.1.0",
   "description": "Persistent per-channel Claude Agent SDK bridge for Discord — warm turns in 1.5–2s, native image attachments, file-based access control.",
   "type": "module",

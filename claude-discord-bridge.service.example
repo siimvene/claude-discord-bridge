@@ -1,11 +1,11 @@
 [Unit]
-Description=Discord Bridge (persistent Claude Agent SDK sessions)
+Description=Claude Discord Bridge (persistent Claude Agent SDK sessions)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=/home/YOUR_USER/projects/discord-bridge
+WorkingDirectory=/home/YOUR_USER/projects/claude-discord-bridge
 ExecStart=/usr/bin/node bridge.mjs
 Restart=on-failure
 RestartSec=10
@@ -16,7 +16,7 @@ Environment=HOME=/home/YOUR_USER
 Environment=PATH=/home/YOUR_USER/.npm-global/bin:/usr/local/bin:/usr/bin:/bin
 
 # Discord token + any overrides (ACCESS_JSON, STATE_DIR, etc.)
-EnvironmentFile=/home/YOUR_USER/projects/discord-bridge/.env
+EnvironmentFile=/home/YOUR_USER/projects/claude-discord-bridge/.env
 
 [Install]
 WantedBy=default.target
