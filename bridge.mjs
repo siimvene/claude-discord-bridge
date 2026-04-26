@@ -1,31 +1,20 @@
 import { Client, GatewayIntentBits, Partials, EmbedBuilder } from 'discord.js';
-import { query } from '@anthropic-ai/claude-agent-sdk';
+import { jules, JulesError } from '@google/jules-sdk';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import 'dotenv/config';
-import { IMAGE_MIME, buildContent, splitMessage, resolvePermissionMode } from './lib.mjs';
+import { IMAGE_MIME, buildContent, splitMessage } from './lib.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const ACCESS_JSON = process.env.ACCESS_JSON || path.join(__dirname, 'access.json');
 const STATE_DIR = process.env.STATE_DIR || path.join(__dirname, 'state');
 const STATE_FILE = path.join(STATE_DIR, 'sessions.json');
-const CONTEXT_WINDOW = Number(process.env.CONTEXT_WINDOW || 1_000_000);
 const MAX_ATTACHMENT_BYTES = Number(process.env.MAX_ATTACHMENT_BYTES || 25 * 1024 * 1024);
-// Anthropic Messages API caps images at 5MB raw and 8000x8000 px. We can't easily
-// check dimensions without decoding, but we can enforce the byte cap up front.
 const MAX_IMAGE_BYTES = Number(process.env.MAX_IMAGE_BYTES || 5 * 1024 * 1024);
 
-// SDK permission mode: 'default' | 'acceptEdits' | 'bypassPermissions' | 'plan'.
-// 'default' will hang in a non-interactive bot context (no human to approve tools),
-// so the practical choices are 'bypassPermissions' (full agency, default) or
-// 'acceptEdits' (auto-approve file edits but block other tools).
-// SECURITY: 'bypassPermissions' lets anyone authorized in your access.json run
-// arbitrary shell commands on the host. Treat it like SSH access.
-const PERMISSION_MODE = resolvePermissionMode(process.env.PERMISSION_MODE);
-
-// Agent lifecycle. Each ChannelAgent holds a persistent Claude subprocess +
+// Agent lifecycle. Each ChannelAgent holds a persistent session.
 // MCP children, costing ~500-600MB resident. To keep memory bounded:
 //   - Idle agents are closed after IDLE_MINUTES of inactivity. Their session
 //     pointer persists in state/sessions.json, so the next message resumes
@@ -42,13 +31,11 @@ fs.mkdirSync(STATE_DIR, { recursive: true });
 // ----- state -----
 const sessions = new Map();
 const turnCounts = new Map();
-const cumulativeTokens = new Map();
 
 function loadState() {
   try {
     const data = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
     for (const [k, v] of Object.entries(data.sessions || {})) sessions.set(k, v);
-    for (const [k, v] of Object.entries(data.tokens || {})) cumulativeTokens.set(k, v);
     for (const [k, v] of Object.entries(data.turns || {})) turnCounts.set(k, v);
     console.log(`[state] loaded ${sessions.size} sessions from ${STATE_FILE}`);
   } catch (err) {
@@ -63,7 +50,6 @@ function saveState() {
     saveTimer = null;
     const data = {
       sessions: Object.fromEntries(sessions),
-      tokens: Object.fromEntries(cumulativeTokens),
       turns: Object.fromEntries(turnCounts),
     };
     try {
@@ -144,17 +130,13 @@ async function fetchAttachments(msg) {
 class ChannelAgent {
   constructor(channelId) {
     this.channelId = channelId;
-    this.queue = [];
-    this.resolvers = [];
     this.closed = false;
     this.busy = false;
     this.sessionId = sessions.get(channelId) || null;
     this.pendingResolve = null;
-    this.responseText = '';
-    this.responseUsage = null;
     this.lastActivity = Date.now();
     this._idleTimer = null;
-    this._startStream();
+    this.session = null;
     this._scheduleIdleClose();
   }
 
@@ -167,145 +149,61 @@ class ChannelAgent {
     if (IDLE_MS <= 0 || this.closed) return;
     if (this._idleTimer) clearTimeout(this._idleTimer);
     const t = setTimeout(() => {
-      // Don't evict mid-turn; reschedule and check again later.
       if (this.pendingResolve) { this._scheduleIdleClose(); return; }
       const idleMin = Math.round((Date.now() - this.lastActivity) / 60000);
       console.log(`[${this.channelId}] idle ${idleMin}min — closing agent (session ${this.sessionId} preserved)`);
       this.close();
       if (agents.get(this.channelId) === this) agents.delete(this.channelId);
     }, IDLE_MS);
-    // Don't keep the event loop alive on idle agents during graceful shutdown.
     t.unref?.();
     this._idleTimer = t;
-  }
-
-  _push(envelope) {
-    if (this.resolvers.length) this.resolvers.shift()(envelope);
-    else this.queue.push(envelope);
-  }
-
-  async *_feed() {
-    while (!this.closed) {
-      const env = this.queue.length ? this.queue.shift() : await new Promise(r => this.resolvers.push(r));
-      if (env === null) break;
-      yield {
-        type: 'user',
-        message: { role: 'user', content: env.content },
-        parent_tool_use_id: null,
-      };
-    }
-  }
-
-  _startStream() {
-    const options = { permissionMode: PERMISSION_MODE };
-    if (this.sessionId) options.resume = this.sessionId;
-
-    this.stream = query({ prompt: this._feed(), options });
-
-    (async () => {
-      try {
-        for await (const msg of this.stream) {
-          if (msg.type === 'system' && msg.subtype === 'init') {
-            const sid = msg.session_id ?? msg.sessionId;
-            if (sid && sid !== this.sessionId) {
-              this.sessionId = sid;
-              sessions.set(this.channelId, sid);
-              saveState();
-              console.log(`[${this.channelId}] session=${sid}`);
-            }
-            continue;
-          }
-          if (msg.type === 'assistant' && msg.message?.content) {
-            for (const block of msg.message.content) {
-              if (block.type === 'text') this.responseText += block.text;
-            }
-            continue;
-          }
-          if (msg.type === 'result') {
-            this.responseUsage = msg.usage ?? null;
-            const resolve = this.pendingResolve;
-            this.pendingResolve = null;
-            const text = this.responseText;
-            const usage = this.responseUsage;
-            this.responseText = '';
-            this.responseUsage = null;
-            // SDK signals errors via `is_error` / non-success subtypes on the result
-            // message. Surface them; otherwise the user sees a silent empty reply.
-            // (The SDK may also throw on the next iteration — handled in catch.)
-            const isError = msg.is_error === true ||
-              (typeof msg.subtype === 'string' && msg.subtype !== 'success');
-            if (resolve) {
-              if (isError) {
-                let reason;
-                if (msg.result) {
-                  reason = String(msg.result);
-                } else if (msg.subtype === 'error_during_execution' && this.sessionId) {
-                  // Most common cause when we'd been resuming: target session is gone.
-                  // SDK self-recovers on the next turn; tell the user to retry.
-                  reason = 'turn failed during execution (likely stale session — please retry)';
-                } else {
-                  reason = msg.subtype || 'execution error';
-                }
-                resolve({ text, usage, error: String(reason) });
-              } else {
-                resolve({ text, usage });
-              }
-            }
-          }
-        }
-      } catch (err) {
-        console.error(`[${this.channelId}] stream error: ${err.message}`);
-        const isStaleSession = /no conversation found/i.test(err.message);
-        if (isStaleSession) {
-          // The previous resume target is gone. Clear pointer state, terminate any
-          // stale _feed() awaits routed to the dead generator, then start a fresh
-          // stream that will create a new session on next yield.
-          const previous = this.sessionId;
-          this.sessionId = null;
-          sessions.delete(this.channelId);
-          saveState();
-          this.responseText = '';
-          this.responseUsage = null;
-          while (this.resolvers.length) {
-            const r = this.resolvers.shift();
-            try { r(null); } catch {}
-          }
-          if (this.pendingResolve) {
-            const resolve = this.pendingResolve;
-            this.pendingResolve = null;
-            resolve({
-              text: '',
-              usage: null,
-              error: `stale session ${previous || '(unknown)'} cleared — please resend`,
-            });
-          }
-          console.log(`[${this.channelId}] stale session ${previous || '(unknown)'} — cleared, restarting stream`);
-          this._startStream();
-          return;
-        }
-        if (this.pendingResolve) {
-          this.pendingResolve({ text: '', usage: null, error: err.message });
-          this.pendingResolve = null;
-        }
-        this.closed = true;
-      }
-    })();
   }
 
   async send(content) {
     if (this.closed) throw new Error('agent closed');
     if (this.pendingResolve) throw new Error('agent busy with previous turn');
     this._touch();
-    return new Promise((resolve) => {
-      this.pendingResolve = resolve;
-      this._push({ content });
-    });
+
+    // We mock pendingResolve to lock the agent so idle eviction doesn't kill it mid-turn
+    this.pendingResolve = true;
+
+    try {
+      if (this.sessionId && !this.session) {
+        this.session = jules.session(this.sessionId);
+      } else if (!this.session) {
+        this.session = await jules.session({ prompt: 'You are a helpful coding agent.' });
+        this.sessionId = this.session.id;
+        sessions.set(this.channelId, this.sessionId);
+        saveState();
+        console.log(`[${this.channelId}] session=${this.sessionId}`);
+      }
+
+      const reply = await this.session.ask(content);
+      this.pendingResolve = null;
+      return { text: reply.message };
+    } catch (err) {
+      this.pendingResolve = null;
+      console.error(`[${this.channelId}] stream error: ${err.message}`);
+
+      if (err instanceof JulesError) {
+        const previous = this.sessionId;
+        this.sessionId = null;
+        this.session = null;
+        sessions.delete(this.channelId);
+        saveState();
+        return {
+          text: '',
+          error: `stale session ${previous || '(unknown)'} cleared — please resend`,
+        };
+      }
+
+      return { text: '', error: err.message };
+    }
   }
 
   close() {
     this.closed = true;
     if (this._idleTimer) { clearTimeout(this._idleTimer); this._idleTimer = null; }
-    while (this.resolvers.length) this.resolvers.shift()(null);
   }
 }
 
@@ -346,15 +244,8 @@ function getAgent(channelId) {
 
 function buildContextEmbed(channelId) {
   const turn = turnCounts.get(channelId) || 0;
-  const tok = cumulativeTokens.get(channelId) || { total: 0 };
-  const fillPct = Math.min(tok.total / CONTEXT_WINDOW, 1);
-  const fillRounded = Math.round(fillPct * 100);
-  const filled = Math.round(fillPct * 10);
-  const bar = '█'.repeat(filled) + '░'.repeat(10 - filled);
-  const tokensK = (tok.total / 1000).toFixed(1);
-  const windowK = (CONTEXT_WINDOW / 1000).toFixed(0);
-  const footer = `${bar} ${fillRounded}% · Turn ${turn} · ${tokensK}k / ${windowK}k tokens`;
-  const color = fillRounded >= 75 ? 0xed4245 : fillRounded >= 50 ? 0xfee75c : 0x57f287;
+  const footer = `Turn ${turn}`;
+  const color = 0x57f287;
   return new EmbedBuilder().setColor(color).setFooter({ text: footer });
 }
 
@@ -374,7 +265,6 @@ async function processQueue(channelId) {
       if (a) { a.close(); agents.delete(channelId); }
       sessions.delete(channelId);
       turnCounts.delete(channelId);
-      cumulativeTokens.delete(channelId);
       saveState();
       console.log(`[${channelId}] cleared by !!clear`);
       await msg.reply('Session cleared. Next message starts fresh.').catch(() => {});
@@ -397,13 +287,6 @@ async function processQueue(channelId) {
       console.log(`[${channelId}] turn ${(turnCounts.get(channelId) ?? 0) + 1} done in ${Date.now() - t0}ms`);
 
       turnCounts.set(channelId, (turnCounts.get(channelId) || 0) + 1);
-      if (result.usage) {
-        const prev = cumulativeTokens.get(channelId) || { input: 0, output: 0, total: 0 };
-        prev.input += result.usage.input_tokens || 0;
-        prev.output += result.usage.output_tokens || 0;
-        prev.total = prev.input + prev.output;
-        cumulativeTokens.set(channelId, prev);
-      }
       saveState();
 
       const text = result.text || (result.error ? `Error: ${result.error}` : '*(empty response)*');
