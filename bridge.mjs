@@ -187,7 +187,7 @@ class ChannelAgent {
       this.pendingResolve = null;
       console.error(`[${this.channelId}] stream error: ${err.message}`);
 
-      if (err instanceof JulesError) {
+      if (err instanceof JulesError || err.status === 404 || (err.message && err.message.includes('404'))) {
         const previous = this.sessionId;
         this.sessionId = null;
         this.session = null;
